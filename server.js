@@ -15,31 +15,49 @@ const logRoutes = require('./routes/logs');
 const app = express();
 const server = http.createServer(app);
 
+// ─── CORS: allow Vercel frontend + localhost ──────────────────────────────────
+const ALLOWED_ORIGINS = [
+  process.env.CLIENT_URL,
+  'http://localhost:3000',
+  'http://localhost:5173',
+].filter(Boolean);
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, Postman, AI model)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn('[CORS] Blocked origin:', origin);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
+// ✅ Handle preflight OPTIONS requests for ALL routes
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
+app.use(express.json());
+
+// ─── Socket.IO ────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    origin: ALLOWED_ORIGINS,
     methods: ['GET', 'POST'],
     credentials: true,
   },
 });
 
-// Make io accessible in routes
 app.set('io', io);
 
-// Middleware
-app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3000',
-  credentials: true,
-}));
-app.use(express.json());
-
-// Routes
+// ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/status', statusRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/logs', logRoutes);
 
-// Shortcut alias for AI model: POST /api/update → /api/status/update
+// Shortcut alias for AI model: POST /api/update
 app.post('/api/update', (req, res) => {
   req.url = '/update';
   statusRoutes(req, res);
@@ -49,49 +67,37 @@ app.post('/api/update', (req, res) => {
 app.get('/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));
 
 // ─── WebRTC Signaling via Socket.IO ──────────────────────────────────────────
-
-// Track rooms: roomId -> Set of socket IDs
 const rooms = new Map();
 
 io.on('connection', (socket) => {
   console.log(`[Socket] Client connected: ${socket.id}`);
 
-  // ── WebRTC Room Management ──
   socket.on('join-room', (roomId) => {
     socket.join(roomId);
     if (!rooms.has(roomId)) rooms.set(roomId, new Set());
     rooms.get(roomId).add(socket.id);
-
     const peers = [...rooms.get(roomId)].filter(id => id !== socket.id);
     socket.emit('room-peers', peers);
     socket.to(roomId).emit('peer-joined', socket.id);
     console.log(`[WebRTC] ${socket.id} joined room ${roomId}`);
   });
 
-  socket.on('leave-room', (roomId) => {
-    leaveRoom(socket, roomId);
-  });
+  socket.on('leave-room', (roomId) => leaveRoom(socket, roomId));
 
-  // ── WebRTC Signaling (offer/answer/ice) ──
   socket.on('webrtc-offer', ({ to, offer }) => {
     socket.to(to).emit('webrtc-offer', { from: socket.id, offer });
   });
-
   socket.on('webrtc-answer', ({ to, answer }) => {
     socket.to(to).emit('webrtc-answer', { from: socket.id, answer });
   });
-
   socket.on('webrtc-ice-candidate', ({ to, candidate }) => {
     socket.to(to).emit('webrtc-ice-candidate', { from: socket.id, candidate });
   });
 
-  // ── Disconnect cleanup ──
   socket.on('disconnect', () => {
     console.log(`[Socket] Client disconnected: ${socket.id}`);
     rooms.forEach((members, roomId) => {
-      if (members.has(socket.id)) {
-        leaveRoom(socket, roomId);
-      }
+      if (members.has(socket.id)) leaveRoom(socket, roomId);
     });
   });
 });
@@ -105,7 +111,7 @@ function leaveRoom(socket, roomId) {
   }
 }
 
-// ─── MongoDB Connection ───────────────────────────────────────────────────────
+// ─── MongoDB + Start Server ───────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => {
     console.log('[DB] MongoDB connected');
